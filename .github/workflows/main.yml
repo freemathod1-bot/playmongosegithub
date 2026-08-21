@@ -1,4 +1,4 @@
-name: DoodStream Extractor Action
+name: DoodStream Extractor Action (Direct / No Proxies)
 
 on:
   workflow_dispatch:
@@ -12,7 +12,6 @@ on:
         required: false
         default: ""
   schedule:
-    # Run daily at 00:00 UTC (Optional, customize or remove if only manual)
     - cron: '0 0 * * *'
 
 permissions:
@@ -37,14 +36,14 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Stream Extractor (Single ID or Batch)
+      - name: Run Direct Stream Extractor
         run: |
           if [ -n "${{ github.event.inputs.tmdb_or_imdb_id }}" ]; then
-            python run_extractor.py --id "${{ github.event.inputs.tmdb_or_imdb_id }}"
+            python run_extractor_direct.py --id "${{ github.event.inputs.tmdb_or_imdb_id }}"
           elif [ -n "${{ github.event.inputs.limit }}" ]; then
-            python run_extractor.py --limit "${{ github.event.inputs.limit }}" --out extracted_streams.json
+            python run_extractor_direct.py --limit "${{ github.event.inputs.limit }}" --out extracted_streams.json
           else
-            python run_extractor.py --out extracted_streams.json
+            python run_extractor_direct.py --out extracted_streams.json
           fi
 
       - name: Upload Extracted JSON as Artifact
