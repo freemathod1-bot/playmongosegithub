@@ -53,7 +53,6 @@ MIRRORS = [
     "vidply.com",
     "ds2play.com",
     "ds2video.com",
-    "d-s.io",
     "d000d.com",
     "d0000d.com",
     "dood.ws",
@@ -67,6 +66,7 @@ UA = (
     "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
 )
 
+# Note: Explicitly use gzip, deflate so python-requests cleanly decodes responses across all Linux environments
 BROWSER_HEADERS = {
     "User-Agent": UA,
     "Accept": (
@@ -75,7 +75,7 @@ BROWSER_HEADERS = {
         "application/signed-exchange;v=b3;q=0.7"
     ),
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
     "Upgrade-Insecure-Requests": "1",
     "sec-ch-ua": '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
     "sec-ch-ua-mobile": "?0",
@@ -148,12 +148,15 @@ def _try_mirror(session, mirror: str, vid: str, debug_tag: str = "") -> Optional
     url = f"https://{mirror}/e/{vid}"
     try:
         r = session.get(url, timeout=(5, 10), allow_redirects=True)
-        has_md5 = "/pass_md5/" in r.text
-        logger.info(f"[{debug_tag}] GET {mirror}/e/{vid} -> status={r.status_code}, len={len(r.text)}, pass_md5={has_md5}")
+        html_text = r.text
+        has_md5 = "/pass_md5/" in html_text
+        logger.info(f"[{debug_tag}] GET {mirror}/e/{vid} -> status={r.status_code}, len={len(html_text)}, pass_md5={has_md5}")
         if r.status_code == 200 and has_md5:
-            return str(r.url), r.text
+            return str(r.url), html_text
         if r.status_code != 200:
-            logger.warning(f"[{debug_tag}] {mirror} returned HTTP {r.status_code} (HTML Snippet: {r.text[:120]!r})")
+            logger.warning(f"[{debug_tag}] {mirror} returned HTTP {r.status_code} (Snippet: {html_text[:120]!r})")
+        elif not has_md5:
+            logger.warning(f"[{debug_tag}] {mirror} 200 OK but pass_md5 missing (Snippet: {html_text[:140]!r})")
     except Exception as exc:
         logger.warning(f"[{debug_tag}] Connection error on {mirror}: {exc.__class__.__name__} - {exc}")
         return None
@@ -184,7 +187,7 @@ def _load_player(vid: str, mirrors: Iterable[str]) -> Tuple[Any, str, str]:
 
     # 2. Fallback direct without proxy
     logger.info("==> Trying direct connection without proxies as fallback...")
-    for engine in ["cloudscraper", "requests"]:
+    for engine in ["requests", "cloudscraper"]:
         if engine == "cloudscraper" and cloudscraper is None:
             continue
         session_direct = _build_session(engine=engine)
@@ -254,7 +257,7 @@ def extract_dood(url_or_id: str) -> dict:
 
 def get_dood_url_from_entry(entry: dict) -> Optional[str]:
     dood_domains = (
-        "dood", "ds2play", "ds2video", "d000d", "d0000d", "d-s.io", "vidply", "playmogo", "playmongo"
+        "dood", "ds2play", "ds2video", "d000d", "d0000d", "d-s.io", "vidply", "playmogo.com", "playmongo"
     )
     for k, v in entry.items():
         if isinstance(v, str) and any(d in v.lower() for d in dood_domains):
