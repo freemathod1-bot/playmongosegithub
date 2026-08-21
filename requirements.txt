@@ -3,3 +3,5 @@ uvicorn[standard]>=0.22.0
 requests>=2.31.0
 cloudscraper>=1.2.71
 gunicorn>=21.2.0
+brotli>=1.0.9
+brotlipy>=0.7.0
