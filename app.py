@@ -1,17 +1,7 @@
 """
 Render-ready FastAPI Web Service for DoodStream / Playmogo Extraction & ID Lookup.
 
-Configured with dedicated residential proxy pool + Cloudscraper:
-  - 31.59.20.176:6754 (UK)
-  - 31.56.127.193:7684 (US)
-  - 45.38.107.97:6014 (UK)
-  - 198.105.121.200:6462 (UK)
-  - 64.137.96.74:6641 (ES)
-  - 198.23.243.226:6361 (US)
-  - 38.154.185.97:6370 (US)
-  - 84.247.60.125:6095 (PL)
-  - 142.111.67.146:5611 (JP)
-  - 191.96.254.138:6185 (US)
+
 """
 
 from __future__ import annotations
