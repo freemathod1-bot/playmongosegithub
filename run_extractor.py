@@ -1,14 +1,14 @@
 """
-GitHub Actions Runner / Batch Extractor Script for DoodStream & Playmogo with Full Verbose Debug Logging.
+Direct GitHub Actions Batch / CLI Stream Extractor (Zero Proxies / Pure Direct Connection).
 
 Modes of operation:
 1. Batch Mode (Default for GitHub Actions):
-   Iterates through merged_movie_streaming_data.json, extracts live direct MP4 stream URLs
-   using dedicated residential proxies, and saves to extracted_streams.json.
+   Iterates through merged_movie_streaming_data.json, directly extracts live MP4 stream URLs,
+   and saves results to extracted_streams.json.
 2. CLI / Single ID Lookup Mode:
-   python run_extractor.py --id 81
-   python run_extractor.py --id tt0087544
-   python run_extractor.py --url https://dood.watch/e/yf1wzl7rq2yv
+   python run_extractor_direct.py --id 81
+   python run_extractor_direct.py --id tt0087544
+   python run_extractor_direct.py --url https://dood.watch/e/yf1wzl7rq2yv
 """
 
 from __future__ import annotations
@@ -32,13 +32,13 @@ try:
 except Exception:
     cloudscraper = None
 
-# Configure logging to print immediately to stdout for GitHub Actions logs
+# Configure logging for immediate stdout output in GitHub Actions
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("dood_extractor")
+logger = logging.getLogger("dood_direct_extractor")
 
 # ---------------------------------------------------------------------------
 # Config & Mirrors
@@ -66,7 +66,7 @@ UA = (
     "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
 )
 
-# Note: Explicitly use gzip, deflate so python-requests cleanly decodes responses across all Linux environments
+# Explicitly use gzip, deflate for clean decompression on Linux / GitHub Actions
 BROWSER_HEADERS = {
     "User-Agent": UA,
     "Accept": (
@@ -87,36 +87,9 @@ BROWSER_HEADERS = {
     "DNT": "1",
 }
 
-# ---------------------------------------------------------------------------
-# Dedicated Residential Proxy Pool
-# ---------------------------------------------------------------------------
-
-RESIDENTIAL_PROXIES: List[str] = [
-    "http://viqhajod:aisg6z1gsn25@31.59.20.176:6754",
-    "http://viqhajod:aisg6z1gsn25@31.56.127.193:7684",
-    "http://viqhajod:aisg6z1gsn25@45.38.107.97:6014",
-    "http://viqhajod:aisg6z1gsn25@198.105.121.200:6462",
-    "http://viqhajod:aisg6z1gsn25@64.137.96.74:6641",
-    "http://viqhajod:aisg6z1gsn25@198.23.243.226:6361",
-    "http://viqhajod:aisg6z1gsn25@38.154.185.97:6370",
-    "http://viqhajod:aisg6z1gsn25@84.247.60.125:6095",
-    "http://viqhajod:aisg6z1gsn25@142.111.67.146:5611",
-    "http://viqhajod:aisg6z1gsn25@191.96.254.138:6185",
-]
-
-def get_proxy_dict(proxy_url: str) -> dict:
-    return {"http": proxy_url, "https": proxy_url}
-
-
-def _mask_proxy(p: str) -> str:
-    """Mask credentials for safe logging in GitHub Actions."""
-    if "@" in p:
-        return p.split("@")[-1]
-    return p
-
 
 # ---------------------------------------------------------------------------
-# Extractor Logic
+# Extractor Logic (Pure Direct - No Proxies)
 # ---------------------------------------------------------------------------
 
 def _video_id(s: str) -> str:
@@ -130,7 +103,7 @@ def _make_play(token: str) -> str:
     return f"{rnd}?token={token}&expiry={int(time.time() * 1000)}"
 
 
-def _build_session(engine: str = "requests", proxy_url: Optional[str] = None):
+def _build_session(engine: str = "cloudscraper"):
     if engine == "cloudscraper" and cloudscraper is not None:
         s = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
@@ -139,8 +112,6 @@ def _build_session(engine: str = "requests", proxy_url: Optional[str] = None):
         s = requests.Session()
 
     s.headers.update(BROWSER_HEADERS)
-    if proxy_url:
-        s.proxies = get_proxy_dict(proxy_url)
     return s
 
 
@@ -150,57 +121,35 @@ def _try_mirror(session, mirror: str, vid: str, debug_tag: str = "") -> Optional
         r = session.get(url, timeout=(5, 10), allow_redirects=True)
         html_text = r.text
         has_md5 = "/pass_md5/" in html_text
-        logger.info(f"[{debug_tag}] GET {mirror}/e/{vid} -> status={r.status_code}, len={len(html_text)}, pass_md5={has_md5}")
+        if debug_tag:
+            logger.info(f"[{debug_tag}] GET {mirror}/e/{vid} -> status={r.status_code}, len={len(html_text)}, pass_md5={has_md5}")
         if r.status_code == 200 and has_md5:
             return str(r.url), html_text
         if r.status_code != 200:
-            logger.warning(f"[{debug_tag}] {mirror} returned HTTP {r.status_code} (Snippet: {html_text[:120]!r})")
-        elif not has_md5:
-            logger.warning(f"[{debug_tag}] {mirror} 200 OK but pass_md5 missing (Snippet: {html_text[:140]!r})")
+            logger.warning(f"[{debug_tag}] {mirror} returned HTTP {r.status_code}")
     except Exception as exc:
-        logger.warning(f"[{debug_tag}] Connection error on {mirror}: {exc.__class__.__name__} - {exc}")
+        if debug_tag:
+            logger.warning(f"[{debug_tag}] Connection error on {mirror}: {exc.__class__.__name__}")
         return None
     return None
 
 
 def _load_player(vid: str, mirrors: Iterable[str]) -> Tuple[Any, str, str]:
-    proxies_to_try = list(RESIDENTIAL_PROXIES)
-    random.shuffle(proxies_to_try)
+    last_err = None
+    engines = ["cloudscraper", "requests"] if cloudscraper is not None else ["requests"]
 
-    logger.info(f"==> Starting extraction for video_id={vid}")
-    logger.info(f"==> Total residential proxies available: {len(proxies_to_try)}")
-
-    # 1. Try with Residential Proxy pool (requests first, then cloudscraper)
-    for proxy in proxies_to_try:
-        masked = _mask_proxy(proxy)
-        for engine in ["requests", "cloudscraper"]:
-            if engine == "cloudscraper" and cloudscraper is None:
-                continue
-            session = _build_session(engine=engine, proxy_url=proxy)
-            for m in mirrors[:5]:  # Try top 5 fastest mirrors
-                tag = f"{engine} via {masked}"
-                hit = _try_mirror(session, m, vid, debug_tag=tag)
-                if hit:
-                    final_url, html = hit
-                    logger.info(f"==> SUCCESS: Mirror {m} matched via proxy {masked}")
-                    return session, final_url, html
-
-    # 2. Fallback direct without proxy
-    logger.info("==> Trying direct connection without proxies as fallback...")
-    for engine in ["requests", "cloudscraper"]:
-        if engine == "cloudscraper" and cloudscraper is None:
-            continue
-        session_direct = _build_session(engine=engine)
+    for engine in engines:
+        session = _build_session(engine=engine)
         for m in mirrors:
-            tag = f"direct {engine}"
-            hit = _try_mirror(session_direct, m, vid, debug_tag=tag)
+            hit = _try_mirror(session, m, vid, debug_tag=f"direct {engine}")
             if hit:
                 final_url, html = hit
-                logger.info(f"==> SUCCESS: Mirror {m} matched directly without proxy")
-                return session_direct, final_url, html
+                logger.info(f"==> SUCCESS: Mirror {m} connected directly via {engine}")
+                return session, final_url, html
+            last_err = m
 
     raise RuntimeError(
-        f"All proxies and mirrors failed for video_id={vid!r}. Check debug log above for individual response codes & errors."
+        f"All mirrors failed for video_id={vid!r}. Last mirror tried: {last_err}."
     )
 
 
@@ -232,7 +181,7 @@ def extract_dood(url_or_id: str) -> dict:
     )
     r2.raise_for_status()
     body = r2.text.strip()
-    logger.info(f"pass_md5 response body: {body[:60]}...")
+    logger.info(f"pass_md5 response: {body[:60]}...")
     if body == "RELOAD" or not body.startswith("http"):
         raise RuntimeError(f"pass_md5 returned non-URL body: {body!r}")
 
@@ -266,11 +215,10 @@ def get_dood_url_from_entry(entry: dict) -> Optional[str]:
 
 
 def run_batch_extraction(db_path: str, output_path: str, limit: Optional[int] = None):
-    logger.info(f"Starting batch extraction from {db_path}...")
+    logger.info(f"Starting direct batch extraction from {db_path}...")
     with open(db_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # Filter items that have a Dood / Playmogo host
     dood_items = []
     for item in data:
         dood_url = get_dood_url_from_entry(item)
@@ -317,11 +265,11 @@ def run_batch_extraction(db_path: str, output_path: str, limit: Optional[int] = 
         json.dump(results, f, indent=2, ensure_ascii=False)
 
     logger.info(f"\n==========================================")
-    logger.info(f"Extraction completed! {success_count}/{len(dood_items)} succeeded. Saved to {output_path}")
+    logger.info(f"Direct extraction completed! {success_count}/{len(dood_items)} succeeded. Saved to {output_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DoodStream / Playmogo Stream Extractor")
+    parser = argparse.ArgumentParser(description="Direct DoodStream / Playmogo Stream Extractor (No Proxies)")
     parser.add_argument("--db", default="merged_movie_streaming_data.json", help="Path to database JSON")
     parser.add_argument("--out", default="extracted_streams.json", help="Path to output JSON")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of movies to process in batch")
