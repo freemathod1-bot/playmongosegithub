@@ -107,16 +107,8 @@ BROWSER_HEADERS = {
 # ---------------------------------------------------------------------------
 
 RESIDENTIAL_PROXIES: List[str] = [
-    "http://viqhajod:aisg6z1gsn25@31.59.20.176:6754",
-    "http://viqhajod:aisg6z1gsn25@31.56.127.193:7684",
-    "http://viqhajod:aisg6z1gsn25@45.38.107.97:6014",
-    "http://viqhajod:aisg6z1gsn25@198.105.121.200:6462",
-    "http://viqhajod:aisg6z1gsn25@64.137.96.74:6641",
-    "http://viqhajod:aisg6z1gsn25@198.23.243.226:6361",
-    "http://viqhajod:aisg6z1gsn25@38.154.185.97:6370",
-    "http://viqhajod:aisg6z1gsn25@84.247.60.125:6095",
-    "http://viqhajod:aisg6z1gsn25@142.111.67.146:5611",
-    "http://viqhajod:aisg6z1gsn25@191.96.254.138:6185",
+    "socks5://zmglmvwl:puz74ldkgj3f@31.59.20.176:6754",
+
 ]
 
 def get_proxy_dict(proxy_url: str) -> dict:
