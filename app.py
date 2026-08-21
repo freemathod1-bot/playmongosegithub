@@ -107,7 +107,7 @@ BROWSER_HEADERS = {
 # ---------------------------------------------------------------------------
 
 RESIDENTIAL_PROXIES: List[str] = [
-    "socks5://zmglmvwl:puz74ldkgj3f@31.59.20.176:6754",
+    "http://viqhajod:aisg6z1gsn25@31.59.20.176:6754",
 
 ]
 
