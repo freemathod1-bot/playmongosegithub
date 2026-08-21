@@ -1,0 +1,62 @@
+name: DoodStream Extractor Action
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Number of movies to extract (Leave empty for all)"
+        required: false
+        default: "10"
+      tmdb_or_imdb_id:
+        description: "Specific TMDB or IMDB ID to extract (e.g. 81 or tt0087544)"
+        required: false
+        default: ""
+  schedule:
+    # Run daily at 00:00 UTC (Optional, customize or remove if only manual)
+    - cron: '0 0 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Stream Extractor (Single ID or Batch)
+        run: |
+          if [ -n "${{ github.event.inputs.tmdb_or_imdb_id }}" ]; then
+            python run_extractor.py --id "${{ github.event.inputs.tmdb_or_imdb_id }}"
+          elif [ -n "${{ github.event.inputs.limit }}" ]; then
+            python run_extractor.py --limit "${{ github.event.inputs.limit }}" --out extracted_streams.json
+          else
+            python run_extractor.py --out extracted_streams.json
+          fi
+
+      - name: Upload Extracted JSON as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: extracted_streams
+          path: extracted_streams.json
+          if-no-files-found: ignore
+
+      - name: Commit & Push Updated Extracted Data
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add -A
+          git diff-index --quiet HEAD || (git commit -m "Auto-update extracted streams [skip ci]" && git push)
