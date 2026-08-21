@@ -1,5 +1,5 @@
 """
-GitHub Actions Runner / Batch Extractor Script for DoodStream & Playmogo.
+GitHub Actions Runner / Batch Extractor Script for DoodStream & Playmogo with Full Verbose Debug Logging.
 
 Modes of operation:
 1. Batch Mode (Default for GitHub Actions):
@@ -20,6 +20,7 @@ import os
 import random
 import re
 import string
+import sys
 import time
 from typing import Dict, Iterable, List, Optional, Tuple, Any
 from urllib.parse import urlparse
@@ -31,9 +32,13 @@ try:
 except Exception:
     cloudscraper = None
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("dood_github_action")
+# Configure logging to print immediately to stdout for GitHub Actions logs
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("dood_extractor")
 
 # ---------------------------------------------------------------------------
 # Config & Mirrors
@@ -103,6 +108,13 @@ def get_proxy_dict(proxy_url: str) -> dict:
     return {"http": proxy_url, "https": proxy_url}
 
 
+def _mask_proxy(p: str) -> str:
+    """Mask credentials for safe logging in GitHub Actions."""
+    if "@" in p:
+        return p.split("@")[-1]
+    return p
+
+
 # ---------------------------------------------------------------------------
 # Extractor Logic
 # ---------------------------------------------------------------------------
@@ -118,7 +130,7 @@ def _make_play(token: str) -> str:
     return f"{rnd}?token={token}&expiry={int(time.time() * 1000)}"
 
 
-def _build_session(engine: str = "cloudscraper", proxy_url: Optional[str] = None):
+def _build_session(engine: str = "requests", proxy_url: Optional[str] = None):
     if engine == "cloudscraper" and cloudscraper is not None:
         s = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
@@ -132,49 +144,60 @@ def _build_session(engine: str = "cloudscraper", proxy_url: Optional[str] = None
     return s
 
 
-def _try_mirror(session, mirror: str, vid: str) -> Optional[Tuple[str, str]]:
+def _try_mirror(session, mirror: str, vid: str, debug_tag: str = "") -> Optional[Tuple[str, str]]:
     url = f"https://{mirror}/e/{vid}"
     try:
-        r = session.get(url, timeout=(4, 7), allow_redirects=True)
-    except requests.RequestException:
+        r = session.get(url, timeout=(5, 10), allow_redirects=True)
+        has_md5 = "/pass_md5/" in r.text
+        logger.info(f"[{debug_tag}] GET {mirror}/e/{vid} -> status={r.status_code}, len={len(r.text)}, pass_md5={has_md5}")
+        if r.status_code == 200 and has_md5:
+            return str(r.url), r.text
+        if r.status_code != 200:
+            logger.warning(f"[{debug_tag}] {mirror} returned HTTP {r.status_code} (HTML Snippet: {r.text[:120]!r})")
+    except Exception as exc:
+        logger.warning(f"[{debug_tag}] Connection error on {mirror}: {exc.__class__.__name__} - {exc}")
         return None
-    if r.status_code != 200 or not r.text:
-        return None
-    if "/pass_md5/" not in r.text:
-        return None
-    return str(r.url), r.text
+    return None
 
 
 def _load_player(vid: str, mirrors: Iterable[str]) -> Tuple[Any, str, str]:
     proxies_to_try = list(RESIDENTIAL_PROXIES)
     random.shuffle(proxies_to_try)
 
-    last_err = None
-    engines = ["cloudscraper", "requests"] if cloudscraper is not None else ["requests"]
+    logger.info(f"==> Starting extraction for video_id={vid}")
+    logger.info(f"==> Total residential proxies available: {len(proxies_to_try)}")
 
-    # 1. Try with Residential Proxy pool
+    # 1. Try with Residential Proxy pool (requests first, then cloudscraper)
     for proxy in proxies_to_try:
-        for engine in engines:
+        masked = _mask_proxy(proxy)
+        for engine in ["requests", "cloudscraper"]:
+            if engine == "cloudscraper" and cloudscraper is None:
+                continue
             session = _build_session(engine=engine, proxy_url=proxy)
-            for m in mirrors[:5]:
-                hit = _try_mirror(session, m, vid)
+            for m in mirrors[:5]:  # Try top 5 fastest mirrors
+                tag = f"{engine} via {masked}"
+                hit = _try_mirror(session, m, vid, debug_tag=tag)
                 if hit:
                     final_url, html = hit
+                    logger.info(f"==> SUCCESS: Mirror {m} matched via proxy {masked}")
                     return session, final_url, html
-                last_err = m
 
     # 2. Fallback direct without proxy
-    for engine in engines:
+    logger.info("==> Trying direct connection without proxies as fallback...")
+    for engine in ["cloudscraper", "requests"]:
+        if engine == "cloudscraper" and cloudscraper is None:
+            continue
         session_direct = _build_session(engine=engine)
         for m in mirrors:
-            hit = _try_mirror(session_direct, m, vid)
+            tag = f"direct {engine}"
+            hit = _try_mirror(session_direct, m, vid, debug_tag=tag)
             if hit:
                 final_url, html = hit
+                logger.info(f"==> SUCCESS: Mirror {m} matched directly without proxy")
                 return session_direct, final_url, html
-            last_err = m
 
     raise RuntimeError(
-        f"No mirror served the player for id={vid!r}. Last tried: {last_err}."
+        f"All proxies and mirrors failed for video_id={vid!r}. Check debug log above for individual response codes & errors."
     )
 
 
@@ -187,10 +210,11 @@ def extract_dood(url_or_id: str) -> dict:
 
     m = re.search(r"\$\.get\(['\"](/pass_md5/[^'\"]+)['\"]", html)
     if not m:
-        raise RuntimeError("pass_md5 endpoint not present in player HTML.")
+        raise RuntimeError(f"pass_md5 endpoint regex match failed in player HTML from {player_url}.")
     pass_md5_path = m.group(1)
     token = pass_md5_path.rstrip("/").rsplit("/", 1)[-1]
 
+    logger.info(f"Fetching pass_md5 from: {base + pass_md5_path}")
     r2 = session.get(
         base + pass_md5_path,
         headers={
@@ -201,14 +225,16 @@ def extract_dood(url_or_id: str) -> dict:
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Dest": "empty",
         },
-        timeout=(4, 8),
+        timeout=(5, 10),
     )
     r2.raise_for_status()
     body = r2.text.strip()
+    logger.info(f"pass_md5 response body: {body[:60]}...")
     if body == "RELOAD" or not body.startswith("http"):
         raise RuntimeError(f"pass_md5 returned non-URL body: {body!r}")
 
     direct = body + _make_play(token)
+    logger.info(f"Direct stream URL assembled successfully!")
 
     return {
         "status": "success",
@@ -259,7 +285,8 @@ def run_batch_extraction(db_path: str, output_path: str, limit: Optional[int] = 
     for idx, (movie, host_url) in enumerate(dood_items, 1):
         title = movie.get("title")
         tmdb_imdb = movie.get("tmdb/imdb")
-        logger.info(f"[{idx}/{len(dood_items)}] Extracting: {title} ({tmdb_imdb}) - {host_url}")
+        logger.info(f"\n==========================================")
+        logger.info(f"[{idx}/{len(dood_items)}] Processing: {title} ({tmdb_imdb}) - {host_url}")
         try:
             extraction = extract_dood(host_url)
             results.append({
@@ -271,9 +298,9 @@ def run_batch_extraction(db_path: str, output_path: str, limit: Optional[int] = 
                 "extracted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             })
             success_count += 1
-            logger.info(f"-> SUCCESS: {extraction['stream_url'][:60]}...")
+            logger.info(f"==> SUCCESS for {title}")
         except Exception as e:
-            logger.warning(f"-> FAILED for {title}: {e}")
+            logger.warning(f"==> FAILED for {title}: {e}")
             results.append({
                 "serial": movie.get("serial"),
                 "title": title,
@@ -286,6 +313,7 @@ def run_batch_extraction(db_path: str, output_path: str, limit: Optional[int] = 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
 
+    logger.info(f"\n==========================================")
     logger.info(f"Extraction completed! {success_count}/{len(dood_items)} succeeded. Saved to {output_path}")
 
 
@@ -307,18 +335,21 @@ def main():
         target_movie = None
         for item in data:
             combo = item.get("tmdb/imdb", "")
-            if args.id.lower() in combo.lower() or args.id == str(item.get("serial")):
+            parts = combo.split("/")
+            if args.id.lower() == combo.lower() or (len(parts) > 0 and args.id.lower() == parts[0].strip().lower()) or (len(parts) > 1 and args.id.lower() == parts[1].strip().lower()) or args.id == str(item.get("serial")):
                 target_movie = item
                 break
         if not target_movie:
-            print(f"Movie ID {args.id} not found.")
-            return
+            logger.error(f"Movie identifier '{args.id}' not found in {args.db}.")
+            sys.exit(1)
         dood_url = get_dood_url_from_entry(target_movie)
         if not dood_url:
-            print(f"No DoodStream link for {target_movie.get('title')}")
-            return
-        print(f"Extracting {target_movie.get('title')} ({dood_url})...")
-        print(json.dumps(extract_dood(dood_url), indent=2))
+            logger.error(f"No DoodStream/Playmogo link found in record for '{target_movie.get('title')}'.")
+            sys.exit(1)
+        logger.info(f"Extracting '{target_movie.get('title')}' ({dood_url})...")
+        res = extract_dood(dood_url)
+        print("\n=== EXTRACTION RESULT ===")
+        print(json.dumps(res, indent=2))
     else:
         run_batch_extraction(args.db, args.out, args.limit)
 
