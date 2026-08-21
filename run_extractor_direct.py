@@ -1,47 +1,54 @@
 """
-Direct GitHub Actions Batch / CLI Stream Extractor (Zero Proxies / Pure Direct Connection).
-
-Modes of operation:
-1. Batch Mode (Default for GitHub Actions):
-   Iterates through merged_movie_streaming_data.json, directly extracts live MP4 stream URLs,
-   and saves results to extracted_streams.json.
-2. CLI / Single ID Lookup Mode:
-   python run_extractor_direct.py --id 81
-   python run_extractor_direct.py --id tt0087544
-   python run_extractor_direct.py --url https://dood.watch/e/yf1wzl7rq2yv
+Render-ready FastAPI Web Service for DoodStream / Playmogo Extraction & ID Lookup.
+ALL requests are forced through the residential proxy pool — no direct fallback.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import os
 import random
 import re
 import string
-import sys
 import time
 from typing import Dict, Iterable, List, Optional, Tuple, Any
 from urllib.parse import urlparse
 
 import requests
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 try:
     import cloudscraper  # type: ignore
 except Exception:
     cloudscraper = None
 
-# Configure logging for immediate stdout output in GitHub Actions
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("dood_api")
+
+app = FastAPI(
+    title="DoodStream Video Extractor API",
+    description=(
+        "FastAPI service for looking up movies by TMDB/IMDB and extracting direct stream links "
+        "with dedicated residential proxy rotation. All requests go through the proxy pool only."
+    ),
+    version="1.3.0",
 )
-logger = logging.getLogger("dood_direct_extractor")
+
+# Enable CORS for browser access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---------------------------------------------------------------------------
-# Config & Mirrors
+# Config & Active Fast Mirrors
 # ---------------------------------------------------------------------------
 
 MIRRORS = [
@@ -53,6 +60,7 @@ MIRRORS = [
     "vidply.com",
     "ds2play.com",
     "ds2video.com",
+    "d-s.io",
     "d000d.com",
     "d0000d.com",
     "dood.ws",
@@ -66,7 +74,6 @@ UA = (
     "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
 )
 
-# Explicitly use gzip, deflate for clean decompression on Linux / GitHub Actions
 BROWSER_HEADERS = {
     "User-Agent": UA,
     "Accept": (
@@ -75,7 +82,7 @@ BROWSER_HEADERS = {
         "application/signed-exchange;v=b3;q=0.7"
     ),
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate",
+    "Accept-Encoding": "gzip, deflate, br",
     "Upgrade-Insecure-Requests": "1",
     "sec-ch-ua": '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
     "sec-ch-ua-mobile": "?0",
@@ -87,9 +94,88 @@ BROWSER_HEADERS = {
     "DNT": "1",
 }
 
+# ---------------------------------------------------------------------------
+# Dedicated Residential Proxy Pool
+# ---------------------------------------------------------------------------
+
+RESIDENTIAL_PROXIES: List[str] = [
+    "http://viqhajod:aisg6z1gsn25@31.59.20.176:6754",
+]
+
+
+def get_proxy_dict(proxy_url: str) -> dict:
+    return {"http": proxy_url, "https": proxy_url}
+
 
 # ---------------------------------------------------------------------------
-# Extractor Logic (Pure Direct - No Proxies)
+# Database In-Memory Cache & Indexing
+# ---------------------------------------------------------------------------
+
+DATABASE_FILE = os.getenv("DATABASE_FILE", "merged_movie_streaming_data.json")
+
+tmdb_index: Dict[str, dict] = {}
+imdb_index: Dict[str, dict] = {}
+combo_index: Dict[str, dict] = {}
+all_items_count = 0
+
+
+def load_database():
+    global all_items_count, tmdb_index, imdb_index, combo_index
+    if not os.path.exists(DATABASE_FILE):
+        logger.warning(
+            f"Database file '{DATABASE_FILE}' not found. Lookup will return empty results."
+        )
+        return
+
+    logger.info(f"Loading database from {DATABASE_FILE}...")
+    try:
+        with open(DATABASE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, list):
+                logger.error("Invalid database format. Expected JSON array.")
+                return
+
+            tmdb_idx: Dict[str, dict] = {}
+            imdb_idx: Dict[str, dict] = {}
+            combo_idx: Dict[str, dict] = {}
+
+            for item in data:
+                combo = item.get("tmdb/imdb", "").strip()
+                if combo:
+                    combo_idx[combo.lower()] = item
+                    parts = combo.split("/")
+                    if len(parts) == 2:
+                        tmdb_id, imdb_id = parts[0].strip(), parts[1].strip()
+                        if tmdb_id:
+                            tmdb_idx[tmdb_id.lower()] = item
+                        if imdb_id:
+                            imdb_idx[imdb_id.lower()] = item
+                    elif len(parts) == 1:
+                        val = parts[0].strip()
+                        if val.startswith("tt"):
+                            imdb_idx[val.lower()] = item
+                        elif val.isdigit():
+                            tmdb_idx[val] = item
+
+            tmdb_index = tmdb_idx
+            imdb_index = imdb_idx
+            combo_index = combo_idx
+            all_items_count = len(data)
+            logger.info(
+                f"Successfully loaded {all_items_count} items. "
+                f"(TMDB Indexed: {len(tmdb_index)}, IMDB Indexed: {len(imdb_index)})"
+            )
+    except Exception as e:
+        logger.error(f"Failed to load database: {e}")
+
+
+@app.on_event("startup")
+def startup_event():
+    load_database()
+
+
+# ---------------------------------------------------------------------------
+# Extractor Logic
 # ---------------------------------------------------------------------------
 
 def _video_id(s: str) -> str:
@@ -103,7 +189,16 @@ def _make_play(token: str) -> str:
     return f"{rnd}?token={token}&expiry={int(time.time() * 1000)}"
 
 
-def _build_session(engine: str = "cloudscraper"):
+def _build_session(engine: str = "cloudscraper", proxy_url: Optional[str] = None):
+    """
+    Build a requests/cloudscraper session.
+    proxy_url is REQUIRED — sessions without a proxy are never created in production flow.
+    """
+    if not proxy_url:
+        raise RuntimeError(
+            "proxy_url is required. Direct (no-proxy) requests are not allowed."
+        )
+
     if engine == "cloudscraper" and cloudscraper is not None:
         s = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
@@ -112,44 +207,59 @@ def _build_session(engine: str = "cloudscraper"):
         s = requests.Session()
 
     s.headers.update(BROWSER_HEADERS)
+    s.proxies = get_proxy_dict(proxy_url)
     return s
 
 
-def _try_mirror(session, mirror: str, vid: str, debug_tag: str = "") -> Optional[Tuple[str, str]]:
+def _try_mirror(session, mirror: str, vid: str) -> Optional[Tuple[str, str]]:
     url = f"https://{mirror}/e/{vid}"
     try:
-        r = session.get(url, timeout=(5, 10), allow_redirects=True)
-        html_text = r.text
-        has_md5 = "/pass_md5/" in html_text
-        if debug_tag:
-            logger.info(f"[{debug_tag}] GET {mirror}/e/{vid} -> status={r.status_code}, len={len(html_text)}, pass_md5={has_md5}")
-        if r.status_code == 200 and has_md5:
-            return str(r.url), html_text
-        if r.status_code != 200:
-            logger.warning(f"[{debug_tag}] {mirror} returned HTTP {r.status_code}")
-    except Exception as exc:
-        if debug_tag:
-            logger.warning(f"[{debug_tag}] Connection error on {mirror}: {exc.__class__.__name__}")
+        r = session.get(url, timeout=(4, 7), allow_redirects=True)
+    except requests.RequestException:
         return None
-    return None
+    if r.status_code != 200 or not r.text:
+        return None
+    if "/pass_md5/" not in r.text:
+        return None
+    return str(r.url), r.text
 
 
 def _load_player(vid: str, mirrors: Iterable[str]) -> Tuple[Any, str, str]:
-    last_err = None
-    engines = ["cloudscraper", "requests"] if cloudscraper is not None else ["requests"]
+    """
+    All requests go through the residential proxy pool ONLY.
+    No direct / no-proxy fallback — ever.
+    """
+    if not RESIDENTIAL_PROXIES:
+        raise RuntimeError(
+            "RESIDENTIAL_PROXIES list is empty. Cannot make any requests without a proxy."
+        )
 
-    for engine in engines:
-        session = _build_session(engine=engine)
-        for m in mirrors:
-            hit = _try_mirror(session, m, vid, debug_tag=f"direct {engine}")
-            if hit:
-                final_url, html = hit
-                logger.info(f"==> SUCCESS: Mirror {m} connected directly via {engine}")
-                return session, final_url, html
-            last_err = m
+    proxies_to_try = list(RESIDENTIAL_PROXIES)
+    random.shuffle(proxies_to_try)
+
+    engines = ["cloudscraper", "requests"] if cloudscraper is not None else ["requests"]
+    mirror_list = list(mirrors)
+
+    for proxy in proxies_to_try:
+        for engine in engines:
+            try:
+                session = _build_session(engine=engine, proxy_url=proxy)
+            except RuntimeError as e:
+                logger.error(f"Session build failed: {e}")
+                continue
+
+            for m in mirror_list[:5]:
+                hit = _try_mirror(session, m, vid)
+                if hit:
+                    final_url, html = hit
+                    logger.info(
+                        f"Success — proxy={proxy!r}, engine={engine}, mirror={m}, vid={vid!r}"
+                    )
+                    return session, final_url, html
 
     raise RuntimeError(
-        f"All mirrors failed for video_id={vid!r}. Last mirror tried: {last_err}."
+        f"All {len(proxies_to_try)} residential proxy/mirror combination(s) exhausted "
+        f"for id={vid!r}. No direct fallback is attempted by design."
     )
 
 
@@ -162,11 +272,10 @@ def extract_dood(url_or_id: str) -> dict:
 
     m = re.search(r"\$\.get\(['\"](/pass_md5/[^'\"]+)['\"]", html)
     if not m:
-        raise RuntimeError(f"pass_md5 endpoint regex match failed in player HTML from {player_url}.")
+        raise RuntimeError("pass_md5 endpoint not present in player HTML.")
     pass_md5_path = m.group(1)
     token = pass_md5_path.rstrip("/").rsplit("/", 1)[-1]
 
-    logger.info(f"Fetching pass_md5 from: {base + pass_md5_path}")
     r2 = session.get(
         base + pass_md5_path,
         headers={
@@ -177,16 +286,14 @@ def extract_dood(url_or_id: str) -> dict:
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Dest": "empty",
         },
-        timeout=(5, 10),
+        timeout=(4, 8),
     )
     r2.raise_for_status()
     body = r2.text.strip()
-    logger.info(f"pass_md5 response: {body[:60]}...")
     if body == "RELOAD" or not body.startswith("http"):
         raise RuntimeError(f"pass_md5 returned non-URL body: {body!r}")
 
     direct = body + _make_play(token)
-    logger.info(f"Direct stream URL assembled successfully!")
 
     return {
         "status": "success",
@@ -199,14 +306,46 @@ def extract_dood(url_or_id: str) -> dict:
         "container": "video/mp4",
         "required_headers": {
             "User-Agent": UA,
-            "Referer": player_url
-        }
+            "Referer": player_url,
+        },
     }
 
 
+# ---------------------------------------------------------------------------
+# Database Helpers
+# ---------------------------------------------------------------------------
+
+def find_in_database(query_id: str) -> Optional[dict]:
+    """Finds record in JSON database using TMDB, IMDB, or Combo ID."""
+    clean_id = query_id.strip().lower()
+
+    # 1. Exact combo match e.g. 81/tt0087544
+    if clean_id in combo_index:
+        return combo_index[clean_id]
+
+    # 2. TMDB ID match (if pure numbers)
+    if clean_id in tmdb_index:
+        return tmdb_index[clean_id]
+
+    # 3. IMDB ID match (e.g. tt0087544)
+    if clean_id in imdb_index:
+        return imdb_index[clean_id]
+
+    return None
+
+
 def get_dood_url_from_entry(entry: dict) -> Optional[str]:
+    """Inspects all host-* keys in entry for dood.watch or playmogo/playmongo mirrors."""
     dood_domains = (
-        "dood", "ds2play", "ds2video", "d000d", "d0000d", "d-s.io", "vidply", "playmogo.com", "playmongo"
+        "dood",
+        "ds2play",
+        "ds2video",
+        "d000d",
+        "d0000d",
+        "d-s.io",
+        "vidply",
+        "playmogo",
+        "playmongo",
     )
     for k, v in entry.items():
         if isinstance(v, str) and any(d in v.lower() for d in dood_domains):
@@ -214,96 +353,153 @@ def get_dood_url_from_entry(entry: dict) -> Optional[str]:
     return None
 
 
-def run_batch_extraction(db_path: str, output_path: str, limit: Optional[int] = None):
-    logger.info(f"Starting direct batch extraction from {db_path}...")
-    with open(db_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+# ---------------------------------------------------------------------------
+# API Routes
+# ---------------------------------------------------------------------------
 
-    dood_items = []
-    for item in data:
-        dood_url = get_dood_url_from_entry(item)
-        if dood_url:
-            dood_items.append((item, dood_url))
+@app.get("/")
+def index():
+    return {
+        "status": "online",
+        "service": "DoodStream API Extractor",
+        "proxy_policy": "All requests are routed through the residential proxy pool. No direct connections.",
+        "total_indexed_movies": all_items_count,
+        "residential_proxies_configured": len(RESIDENTIAL_PROXIES),
+        "examples": [
+            "/api/81",
+            "/api/tt0087544",
+            "/api/81/tt0087544",
+            "/api/extract?url=https://dood.watch/e/yf1wzl7rq2yv",
+            "/api/lookup/81",
+        ],
+    }
 
-    logger.info(f"Found {len(dood_items)} items with DoodStream/Playmogo hosts.")
-    if limit:
-        dood_items = dood_items[:limit]
-        logger.info(f"Processing limited set of {limit} items.")
 
-    results = []
-    success_count = 0
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+        "database_loaded": all_items_count > 0,
+        "proxies_count": len(RESIDENTIAL_PROXIES),
+        "proxy_policy": "proxy-only",
+    }
 
-    for idx, (movie, host_url) in enumerate(dood_items, 1):
-        title = movie.get("title")
-        tmdb_imdb = movie.get("tmdb/imdb")
-        logger.info(f"\n==========================================")
-        logger.info(f"[{idx}/{len(dood_items)}] Processing: {title} ({tmdb_imdb}) - {host_url}")
+
+@app.get("/api/lookup/{query_id:path}")
+def lookup_movie(query_id: str):
+    """Lookup metadata and host links by TMDB / IMDB ID without running stream extraction."""
+    record = find_in_database(query_id)
+    if not record:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Movie with TMDB/IMDB identifier '{query_id}' not found in database.",
+        )
+    return {
+        "status": "found",
+        "query": query_id,
+        "movie": record,
+    }
+
+
+@app.get("/api/extract")
+def extract_by_url(
+    url: str = Query(..., description="Direct DoodStream or Playmogo URL or File ID")
+):
+    """
+    Directly extracts stream URL from a given DoodStream URL or File ID.
+    Request is made exclusively through the residential proxy pool.
+    """
+    try:
+        res = extract_dood(url)
+        return res
+    except Exception as exc:
+        logger.error(f"Extraction error for url '{url}': {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/{query_id:path}")
+def api_resolve(query_id: str):
+    """
+    Unified endpoint:
+    - If TMDB/IMDB ID is passed (e.g., 81, tt0087544, 81/tt0087544),
+      finds the movie in the database, detects dood/playmogo embed, and extracts stream.
+    - If direct URL or file ID is passed, extracts stream directly.
+
+    All outbound HTTP requests are forced through the residential proxy pool.
+    No direct / no-proxy connections are ever made.
+    """
+    clean_query = query_id.strip()
+
+    # 1. Check if it's already a direct Dood/Playmogo/mirror link
+    if (
+        "dood" in clean_query.lower()
+        or "playmogo" in clean_query.lower()
+        or "playmongo" in clean_query.lower()
+        or clean_query.startswith("http")
+    ):
         try:
-            extraction = extract_dood(host_url)
-            results.append({
-                "serial": movie.get("serial"),
-                "title": title,
-                "tmdb/imdb": tmdb_imdb,
-                "source_host": host_url,
-                "stream": extraction,
-                "extracted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            })
-            success_count += 1
-            logger.info(f"==> SUCCESS for {title}")
-        except Exception as e:
-            logger.warning(f"==> FAILED for {title}: {e}")
-            results.append({
-                "serial": movie.get("serial"),
-                "title": title,
-                "tmdb/imdb": tmdb_imdb,
-                "source_host": host_url,
-                "status": "failed",
-                "error": str(e)
-            })
+            return extract_dood(clean_query)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to extract stream: {exc}"
+            )
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
+    # 2. Lookup in JSON database
+    record = find_in_database(clean_query)
+    if not record:
+        # If not found in DB, try treating query_id as a dood video code (alphanumeric)
+        if re.match(r"^[A-Za-z0-9]{8,20}$", clean_query):
+            try:
+                return extract_dood(clean_query)
+            except Exception:
+                pass
+        raise HTTPException(
+            status_code=404,
+            detail=f"Identifier '{clean_query}' not found in database.",
+        )
 
-    logger.info(f"\n==========================================")
-    logger.info(f"Direct extraction completed! {success_count}/{len(dood_items)} succeeded. Saved to {output_path}")
+    # 3. Detect dood / playmogo host from the record
+    dood_url = get_dood_url_from_entry(record)
+    if not dood_url:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "message": (
+                    "Found movie in database, but it does not have a DoodStream "
+                    "or Playmogo host link."
+                ),
+                "movie": record,
+            },
+        )
+
+    # 4. Extract direct stream URL (via proxy only)
+    try:
+        extraction = extract_dood(dood_url)
+        return {
+            "status": "success",
+            "title": record.get("title"),
+            "serial": record.get("serial"),
+            "tmdb_imdb": record.get("tmdb/imdb"),
+            "source_host": dood_url,
+            "stream": extraction,
+        }
+    except Exception as exc:
+        logger.error(
+            f"Extraction error for movie '{record.get('title')}' ({dood_url}): {exc}"
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Extracted host '{dood_url}' failed to resolve stream via proxy: {exc}",
+        )
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Direct DoodStream / Playmogo Stream Extractor (No Proxies)")
-    parser.add_argument("--db", default="merged_movie_streaming_data.json", help="Path to database JSON")
-    parser.add_argument("--out", default="extracted_streams.json", help="Path to output JSON")
-    parser.add_argument("--limit", type=int, default=None, help="Limit number of movies to process in batch")
-    parser.add_argument("--id", type=str, default=None, help="Extract specific TMDB or IMDB ID")
-    parser.add_argument("--url", type=str, default=None, help="Extract specific DoodStream URL")
-
-    args = parser.parse_args()
-
-    if args.url:
-        print(json.dumps(extract_dood(args.url), indent=2))
-    elif args.id:
-        with open(args.db, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        target_movie = None
-        for item in data:
-            combo = item.get("tmdb/imdb", "")
-            parts = combo.split("/")
-            if args.id.lower() == combo.lower() or (len(parts) > 0 and args.id.lower() == parts[0].strip().lower()) or (len(parts) > 1 and args.id.lower() == parts[1].strip().lower()) or args.id == str(item.get("serial")):
-                target_movie = item
-                break
-        if not target_movie:
-            logger.error(f"Movie identifier '{args.id}' not found in {args.db}.")
-            sys.exit(1)
-        dood_url = get_dood_url_from_entry(target_movie)
-        if not dood_url:
-            logger.error(f"No DoodStream/Playmogo link found in record for '{target_movie.get('title')}'.")
-            sys.exit(1)
-        logger.info(f"Extracting '{target_movie.get('title')}' ({dood_url})...")
-        res = extract_dood(dood_url)
-        print("\n=== EXTRACTION RESULT ===")
-        print(json.dumps(res, indent=2))
-    else:
-        run_batch_extraction(args.db, args.out, args.limit)
-
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
